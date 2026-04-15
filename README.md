@@ -58,11 +58,26 @@ Scans your JSONL session logs and calculates how much you've spent on
 cold cache rebuilds — and how much was preventable.
 
 ```bash
-python3 cache-money-audit.py              # last 7 days
-python3 cache-money-audit.py --days 30    # last 30 days
-python3 cache-money-audit.py --verbose    # show every cold turn
-python3 cache-money-audit.py --json       # machine-readable
+python3 cache-money-audit.py                       # last 7 days (subscription mode)
+python3 cache-money-audit.py --days 30             # last 30 days
+python3 cache-money-audit.py --mode api            # frame waste as dollars
+python3 cache-money-audit.py --infer-ttl           # estimate cache TTL from logs
+python3 cache-money-audit.py --verbose             # show every cold turn
+python3 cache-money-audit.py --json                # machine-readable
 ```
+
+Spend framing (two modes):
+- **`subscription`** (default) — cold-rebuild waste and per-session costs
+  framed as percent of total token spend. For Pro/Max users, rate-limit
+  headroom is the real constraint.
+- **`api`** — same spend breakdown up top, but waste shown in dollars.
+
+TTL inference (`--infer-ttl`):
+Buckets intra-session turn pairs by the gap since the previous turn and
+computes the cold-rate in each bucket. TTL is the gap at which cold-rate
+jumps from ~0 to ~1. Useful for sanity-checking whether your plan is
+actually giving you the 5m or 1h TTL you expected — e.g. the Max-plan
+1h TTL has been flaky ([#46829](https://github.com/anthropics/claude-code/issues/46829)).
 
 Example output:
 ```
