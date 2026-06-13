@@ -39,32 +39,44 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-# ─────────────────────── Pricing (per MTok, as of April 2026) ───────────────────────
+# ─────────────────────── Pricing (per MTok, as of June 2026) ───────────────────────
+# Current Claude 4.x / Fable 5 list prices. cache_write is the 5m-TTL rate
+# (1.25x base input); cache_read is 0.1x base input.
 
 PRICING = {
-    "opus": {
-        "input":         15.00,
-        "cache_write":    6.25,   # 5m TTL (was different at 1h)
-        "cache_read":     0.50,
-        "output":        75.00,
+    "fable": {       # Fable 5 / Mythos 5
+        "input":         10.00,
+        "cache_write":   12.50,
+        "cache_read":     1.00,
+        "output":        50.00,
     },
-    "sonnet": {
+    "opus": {        # Opus 4.x
+        "input":          5.00,
+        "cache_write":    6.25,
+        "cache_read":     0.50,
+        "output":        25.00,
+    },
+    "sonnet": {      # Sonnet 4.x
         "input":          3.00,
-        "cache_write":    1.50,
-        "cache_read":     0.15,
+        "cache_write":    3.75,
+        "cache_read":     0.30,
         "output":        15.00,
     },
-    "haiku": {
-        "input":          0.80,
-        "cache_write":    0.40,
-        "cache_read":     0.04,
-        "output":         4.00,
+    "haiku": {       # Haiku 4.5
+        "input":          1.00,
+        "cache_write":    1.25,
+        "cache_read":     0.10,
+        "output":         5.00,
     },
 }
 
 def get_model_tier(model_name: str) -> str:
     model_lower = model_name.lower()
-    if "opus" in model_lower:
+    # Fable 5 / Mythos 5 share one price tier ($10/$50 per MTok). Check before
+    # "opus" so a hypothetical "opus"-containing alias can't shadow it.
+    if "fable" in model_lower or "mythos" in model_lower:
+        return "fable"
+    elif "opus" in model_lower:
         return "opus"
     elif "haiku" in model_lower:
         return "haiku"
@@ -702,7 +714,7 @@ def main():
         print("  By model:")
         print(f"    {'Model':<10} {'Tokens':>14} {'Cost':>12} {'Share':>10}")
         print(f"    {'─'*10} {'─'*14} {'─'*12} {'─'*10}")
-        for tier in ["opus", "sonnet", "haiku"]:
+        for tier in ["fable", "opus", "sonnet", "haiku"]:
             if tier in tier_breakdown:
                 tb = tier_breakdown[tier]
                 tier_tokens = (tb["input_tokens"] + tb["cache_write_tokens"]
@@ -745,7 +757,7 @@ def main():
         print()
         print(f"  {'Model':<10} {'Cold turns':>12} {'Cold tokens':>14} {waste_col:>12}")
         print(f"  {'─'*10} {'─'*12} {'─'*14} {'─'*12}")
-        for tier in ["opus", "sonnet", "haiku"]:
+        for tier in ["fable", "opus", "sonnet", "haiku"]:
             if tier in by_model:
                 m = by_model[tier]
                 print(f"  {tier:<10} {m['cold_count']:>12,} "
