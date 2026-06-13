@@ -496,6 +496,10 @@ def main():
                                        "cold_tokens": 0, "model": ""})
     by_day = defaultdict(lambda: {"cold_count": 0, "wasted": 0.0,
                                    "cold_tokens": 0})
+    # Per-day spend split by category, over all turns. warm = cache reads,
+    # cold = uncached input + cache writes, output = output tokens. The three
+    # partition total spend (same split as the "By token type" breakdown).
+    by_day_spend = defaultdict(lambda: {"warm": 0.0, "cold": 0.0, "output": 0.0})
 
     # Track per-session turn order to identify first turns
     session_first_turn = {}
@@ -516,15 +520,27 @@ def main():
         total_output_tokens += turn["output_tokens"]
         total_actual += costs["actual_cost"]
 
+        in_cost = turn["input_tokens"] * cost_per_token(tier, "input")
+        cw_cost = turn["cache_creation"] * cost_per_token(tier, "cache_write")
+        cr_cost = turn["cache_read"] * cost_per_token(tier, "cache_read")
+        out_cost = turn["output_tokens"] * cost_per_token(tier, "output")
+
         tb = tier_breakdown[tier]
         tb["input_tokens"] += turn["input_tokens"]
         tb["cache_write_tokens"] += turn["cache_creation"]
         tb["cache_read_tokens"] += turn["cache_read"]
         tb["output_tokens"] += turn["output_tokens"]
-        tb["input_cost"] += turn["input_tokens"] * cost_per_token(tier, "input")
-        tb["cache_write_cost"] += turn["cache_creation"] * cost_per_token(tier, "cache_write")
-        tb["cache_read_cost"] += turn["cache_read"] * cost_per_token(tier, "cache_read")
-        tb["output_cost"] += turn["output_tokens"] * cost_per_token(tier, "output")
+        tb["input_cost"] += in_cost
+        tb["cache_write_cost"] += cw_cost
+        tb["cache_read_cost"] += cr_cost
+        tb["output_cost"] += out_cost
+
+        # Per-day spend by category (every turn, not just cold ones).
+        day = turn["timestamp"].strftime("%Y-%m-%d")
+        bds = by_day_spend[day]
+        bds["warm"] += cr_cost
+        bds["cold"] += in_cost + cw_cost
+        bds["output"] += out_cost
 
         if classification == "cold" and turn["cache_creation"] >= args.threshold:
             cold_turns.append({
@@ -534,8 +550,6 @@ def main():
                 "classification": classification,
             })
             total_wasted += costs["wasted"]
-
-            day = turn["timestamp"].strftime("%Y-%m-%d")
 
             by_model[tier]["cold_count"] += 1
             by_model[tier]["wasted"] += costs["wasted"]
@@ -641,6 +655,19 @@ def main():
             "by_day": {k: {**v, "wasted": round(v["wasted"], 4),
                            "wasted_share": share(v["wasted"])}
                        for k, v in sorted(by_day.items())},
+            "spend_by_day": {
+                k: {
+                    "warm": round(v["warm"], 4),
+                    "cold": round(v["cold"], 4),
+                    "output": round(v["output"], 4),
+                    "total": round(v["warm"] + v["cold"] + v["output"], 4),
+                    "warm_share": share(v["warm"]),
+                    "cold_share": share(v["cold"]),
+                    "output_share": share(v["output"]),
+                    "total_share": share(v["warm"] + v["cold"] + v["output"]),
+                }
+                for k, v in sorted(by_day_spend.items())
+            },
             "worst_sessions": sorted(
                 [{"session": k, **v, "wasted": round(v["wasted"], 4),
                   "wasted_share": share(v["wasted"])}
@@ -724,6 +751,29 @@ def main():
                 pct = format_pct(tier_cost / grand_total_cost) if grand_total_cost > 0 else "0%"
                 print(f"    {tier:<10} {format_tokens(tier_tokens):>14} "
                       f"{format_cost(tier_cost):>12} {pct:>10}")
+        print()
+
+    # ── Spend by day, split warm / cold / output ──
+    if by_day_spend:
+        print("  By day (warm = cache reads, cold = uncached input + cache writes):")
+        print(f"    {'Date':<12} {'Warm':>10} {'Cold':>10} {'Output':>10} {'Total':>10}")
+        print(f"    {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+        run_warm = run_cold = run_output = 0.0
+        for day in sorted(by_day_spend.keys()):
+            d = by_day_spend[day]
+            day_total = d["warm"] + d["cold"] + d["output"]
+            run_warm += d["warm"]; run_cold += d["cold"]; run_output += d["output"]
+            print(f"    {day:<12} "
+                  f"{format_spend(d['warm'], grand_total_cost, args.mode):>10} "
+                  f"{format_spend(d['cold'], grand_total_cost, args.mode):>10} "
+                  f"{format_spend(d['output'], grand_total_cost, args.mode):>10} "
+                  f"{format_spend(day_total, grand_total_cost, args.mode):>10}")
+        print(f"    {'─'*12} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+        print(f"    {'TOTAL':<12} "
+              f"{format_spend(run_warm, grand_total_cost, args.mode):>10} "
+              f"{format_spend(run_cold, grand_total_cost, args.mode):>10} "
+              f"{format_spend(run_output, grand_total_cost, args.mode):>10} "
+              f"{format_spend(run_warm + run_cold + run_output, grand_total_cost, args.mode):>10}")
         print()
 
     # ── Cost impact (framing varies by mode) ──
