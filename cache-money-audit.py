@@ -10,8 +10,14 @@ or when the prompt prefix changes.
 
 Usage:
     python3 cache-money-audit.py                       # last 7 days (subscription mode)
+    python3 cache-money-audit.py --start 18h           # relative lookback
+    python3 cache-money-audit.py --start 2026-09-01    # ISO date or datetime
+    python3 cache-money-audit.py --since-reset         # since the last weekly limit reset
+    python3 cache-money-audit.py --since-5h-reset      # current five-hour limit window
+    python3 cache-money-audit.py --previous-reset      # the weekly window before that
+    python3 cache-money-audit.py --previous-5h-reset   # the last finished five-hour window
     python3 cache-money-audit.py --days 30             # last 30 days
-    python3 cache-money-audit.py --mode api            # frame waste as dollars
+    python3 cache-money-audit.py --mode api           # frame waste as dollars
     python3 cache-money-audit.py --infer-ttl           # estimate cache TTL from logs
     python3 cache-money-audit.py --since 2026-03-01    # since specific date
     python3 cache-money-audit.py --json                # machine-readable output
@@ -36,39 +42,44 @@ import os
 import sys
 import glob
 import argparse
+import functools
+import re
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-# ─────────────────────── Pricing (per MTok, as of June 2026) ───────────────────────
-# Current Claude 4.x / Fable 5 list prices. cache_write is the 5m-TTL rate
-# (1.25x base input); cache_read is 0.1x base input.
+# ─────────────────────── Pricing (per MTok, as of September 2026) ───────────────────────
+# List prices from platform.claude.com/docs/en/about-claude/pricing. Cache
+# writes are 1.25x base input for the 5m TTL and 2x for the 1h TTL. Cache reads
+# are 0.1x base input, except where a model version overrides the multiplier.
 
+def rates(input_price: float, output_price: float, read_mult: float = 0.1) -> dict:
+    return {
+        "input":          input_price,
+        "cache_write_5m": input_price * 1.25,
+        "cache_write_1h": input_price * 2,
+        "cache_read":     input_price * read_mult,
+        "output":         output_price,
+    }
+
+# Keyed by a substring of the model ID. Version-specific rows come before the
+# family row they override; the family row prices every other version.
 PRICING = {
-    "fable": {       # Fable 5 / Mythos 5
-        "input":         10.00,
-        "cache_write":   12.50,
-        "cache_read":     1.00,
-        "output":        50.00,
-    },
-    "opus": {        # Opus 4.x
-        "input":          5.00,
-        "cache_write":    6.25,
-        "cache_read":     0.50,
-        "output":        25.00,
-    },
-    "sonnet": {      # Sonnet 4.x
-        "input":          3.00,
-        "cache_write":    3.75,
-        "cache_read":     0.30,
-        "output":        15.00,
-    },
-    "haiku": {       # Haiku 4.5
-        "input":          1.00,
-        "cache_write":    1.25,
-        "cache_read":     0.10,
-        "output":         5.00,
-    },
+    "fable-5-1": rates(10.00, 50.00, read_mult=0.025),  # Fable 5.1 / Mythos 5.1
+    "fable":     rates(10.00, 50.00),                   # Fable 5 / Mythos 5
+    "opus-5-5":  rates(4.00, 20.00, read_mult=0.05),    # Opus 5.5
+    "opus":      rates(5.00, 25.00),                    # Opus 4.5 – 5
+    "sonnet-5":  rates(2.00, 10.00),                    # Sonnet 5 / 5.5
+    "sonnet":    rates(3.00, 15.00),                    # Sonnet 4.x
+    "haiku":     rates(1.00, 5.00),                     # Haiku 4.5
 }
+
+def get_price_key(model_name: str) -> str:
+    """PRICING row for an exact model ID, falling back to Sonnet 4.x rates."""
+    model_lower = model_name.lower().replace("mythos", "fable")
+    for key in PRICING:
+        if key in model_lower:
+            return key
+    return "sonnet"
 
 def get_model_tier(model_name: str) -> str:
     model_lower = model_name.lower()
@@ -83,8 +94,13 @@ def get_model_tier(model_name: str) -> str:
     else:
         return "sonnet"
 
-def cost_per_token(tier: str, token_type: str) -> float:
-    return PRICING.get(tier, PRICING["sonnet"]).get(token_type, 0) / 1_000_000
+def cost_per_token(turn: dict, token_type: str) -> float:
+    return PRICING[turn["price_key"]][token_type] / 1_000_000
+
+def cache_write_cost(turn: dict) -> float:
+    """Cost of a turn's cache writes, pricing the 5m and 1h TTLs separately."""
+    return (turn["cache_creation_5m"] * cost_per_token(turn, "cache_write_5m")
+            + turn["cache_creation_1h"] * cost_per_token(turn, "cache_write_1h"))
 
 # ─────────────────────── JSONL Parsing ───────────────────────
 
@@ -136,6 +152,12 @@ def parse_session_file(filepath: str, since: datetime):
                 output_tokens = usage.get("output_tokens", 0) or 0
                 input_tokens = usage.get("input_tokens", 0) or 0
 
+                # Per-TTL split of the writes; older logs lack it, so anything
+                # not reported as 1h is priced at the 5m rate.
+                ttl_split = usage.get("cache_creation") or {}
+                cache_creation_1h = min(
+                    ttl_split.get("ephemeral_1h_input_tokens", 0) or 0, cache_creation)
+
                 model = msg.get("model", "unknown")
                 session_id = record.get("sessionId", os.path.basename(filepath).replace(".jsonl", ""))
 
@@ -144,10 +166,14 @@ def parse_session_file(filepath: str, since: datetime):
                     "session_id": session_id,
                     "model": model,
                     "tier": get_model_tier(model),
+                    "price_key": get_price_key(model),
                     "cache_read": cache_read,
                     "cache_creation": cache_creation,
+                    "cache_creation_5m": cache_creation - cache_creation_1h,
+                    "cache_creation_1h": cache_creation_1h,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "cwd": record.get("cwd"),
                     "file": filepath,
                 }
     except (IOError, OSError) as e:
@@ -194,13 +220,11 @@ def classify_turn(turn: dict) -> str:
 
 def calculate_cold_cost(turn: dict) -> dict:
     """Calculate actual cost and what it would have cost if cache was warm."""
-    tier = turn["tier"]
-
-    actual_write_cost = turn["cache_creation"] * cost_per_token(tier, "cache_write")
-    actual_read_cost = turn["cache_read"] * cost_per_token(tier, "cache_read")
+    actual_write_cost = cache_write_cost(turn)
+    actual_read_cost = turn["cache_read"] * cost_per_token(turn, "cache_read")
 
     # If cache had been warm, cache_creation tokens would have been cache_read instead
-    hypothetical_read_cost = (turn["cache_creation"] + turn["cache_read"]) * cost_per_token(tier, "cache_read")
+    hypothetical_read_cost = (turn["cache_creation"] + turn["cache_read"]) * cost_per_token(turn, "cache_read")
 
     actual_total = actual_write_cost + actual_read_cost
     hypothetical_total = hypothetical_read_cost
@@ -422,16 +446,253 @@ def format_spend(cost: float, grand_total: float, mode: str) -> str:
         return format_pct(cost / grand_total)
     return format_cost(cost)
 
+
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_start(raw: str, now: datetime) -> datetime:
+    """Parse a relative lookback or ISO date/datetime as an aware UTC time."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", raw.strip().lower())
+    if match:
+        seconds = float(match.group(1)) * DURATION_UNITS[match.group(2)]
+        return now - timedelta(seconds=seconds)
+
+    parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+WEEK = timedelta(days=7)
+FIVE_HOURS = timedelta(hours=5)
+
+
+def find_limit_resets(files) -> dict:
+    """Latest reset time per limit type ("five_hour", "seven_day").
+
+    Claude Code only logs a reset time on the rejection it writes when a
+    limit is hit, so these are sparse.
+    """
+    latest = {}
+    for filepath in files:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"resetsAt"' not in line:
+                        continue
+                    try:
+                        limits = json.loads(line).get("quotaLimits") or {}
+                        reset = datetime.fromtimestamp(limits["resetsAt"], timezone.utc)
+                    except (ValueError, KeyError, TypeError, AttributeError,
+                            OverflowError, OSError):
+                        continue
+                    kind = limits.get("rateLimitType")
+                    if kind not in latest or reset > latest[kind]:
+                        latest[kind] = reset
+        except (IOError, OSError):
+            continue
+    return latest
+
+
+def weekly_reset_start(resets: dict, now: datetime):
+    """Most recent weekly reset, rolling the last logged one forward by weeks."""
+    anchor = resets.get("seven_day")
+    if anchor is None:
+        raise ValueError("No seven-day limit hit found in the logs, so the weekly "
+                         "reset time is unknown; use --start explicitly.")
+    start = anchor + WEEK * ((now - anchor) // WEEK)
+    return start, {"limit": "seven_day", "logged_reset": anchor.isoformat(),
+                   "resets_at": (start + WEEK).isoformat(), "inferred": True}
+
+
+def previous_weekly_window(resets: dict, now: datetime):
+    """(start, end, source) for the weekly window before the current one."""
+    cur_start, cur = weekly_reset_start(resets, now)
+    start = cur_start - WEEK
+    return start, cur_start, {"limit": "seven_day", "logged_reset": cur["logged_reset"],
+                              "window_start": start.isoformat(),
+                              "resets_at": cur_start.isoformat(),
+                              "ended_at": cur_start.isoformat(), "inferred": True}
+
+
+def five_hour_windows(resets: dict, timestamps, now: datetime):
+    """Replay five-hour windows up to now, oldest first, as (start, end).
+
+    Starts from the last logged five-hour reset (or the first turn in the
+    logs): each window opens on the first turn after the previous one ends,
+    floored to the hour, and lasts five hours.
+    """
+    anchor = resets.get("five_hour")
+    windows = [(anchor - FIVE_HOURS, anchor)] if anchor else []
+    for ts in timestamps:
+        if ts > now:
+            break
+        if not windows or ts >= windows[-1][1]:
+            start = ts.replace(minute=0, second=0, microsecond=0)
+            windows.append((start, start + FIVE_HOURS))
+    if not windows:
+        raise ValueError("No activity in the logs to estimate a five-hour window from.")
+    return windows
+
+
+def five_hour_reset_start(resets: dict, timestamps, now: datetime):
+    """Estimate the start of the current five-hour window."""
+    anchor = resets.get("five_hour")
+    start, end = five_hour_windows(resets, timestamps, now)[-1]
+    if end <= now:
+        raise ValueError(f"No activity since the last five-hour window ended at "
+                         f"{end.isoformat()}.")
+    return start, {"limit": "five_hour",
+                   "logged_reset": anchor.isoformat() if anchor else None,
+                   "resets_at": end.isoformat(), "inferred": True}
+
+
+def previous_five_hour_window(resets: dict, timestamps, now: datetime):
+    """(start, end, source) for the last finished five-hour window.
+
+    That is the window before the current one, or the most recent window if
+    none is open. Flooring a window's start to the hour can overlap it with
+    the one before, so that one is cut off where the next begins.
+    """
+    anchor = resets.get("five_hour")
+    windows = five_hour_windows(resets, timestamps, now)
+    if windows[-1][1] > now:
+        if len(windows) < 2:
+            raise ValueError(f"No five-hour window found before the current one "
+                             f"(started {windows[-1][0].isoformat()}).")
+        (start, reset), (next_start, _) = windows[-2], windows[-1]
+    else:
+        (start, reset), next_start = windows[-1], None
+    end = min(reset, next_start) if next_start else reset
+    return start, end, {"limit": "five_hour",
+                        "logged_reset": anchor.isoformat() if anchor else None,
+                        "window_start": start.isoformat(), "resets_at": reset.isoformat(),
+                        "ended_at": end.isoformat(),
+                        "next_window_start": next_start.isoformat() if next_start else None,
+                        "inferred": True}
+
+
+def spend_row(**extra) -> dict:
+    """Accumulator shared by the model and project breakdowns."""
+    return {
+        "calls": 0,
+        "input_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "output_tokens": 0,
+        "input_cost": 0.0,
+        "cache_write_cost": 0.0,
+        "cache_read_cost": 0.0,
+        "output_cost": 0.0,
+        **extra,
+    }
+
+
+def add_turn(row: dict, turn: dict, costs: dict):
+    row["calls"] += 1
+    row["input_tokens"] += turn["input_tokens"]
+    row["cache_write_tokens"] += turn["cache_creation"]
+    row["cache_read_tokens"] += turn["cache_read"]
+    row["output_tokens"] += turn["output_tokens"]
+    for key, value in costs.items():
+        row[key] += value
+
+
+def row_tokens(row: dict) -> int:
+    return sum(row[k] for k in ("input_tokens", "cache_write_tokens",
+                                "cache_read_tokens", "output_tokens"))
+
+
+def row_cost(row: dict) -> float:
+    return sum(row[k] for k in ("input_cost", "cache_write_cost",
+                                "cache_read_cost", "output_cost"))
+
+
+def repo_root(cwd):
+    """Nearest repository root, including linked and nested agent worktrees."""
+    if not cwd:
+        return None
+    home = os.path.expanduser("~")
+    path = os.path.abspath(cwd)
+    while path != home and os.path.dirname(path) != path:
+        dotgit = os.path.join(path, ".git")
+        if os.path.isdir(dotgit):
+            return path
+        if os.path.isfile(dotgit):
+            try:
+                with open(dotgit, encoding="utf-8") as f:
+                    line = f.readline().strip()
+            except OSError:
+                return path
+            gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+            gitdir = os.path.normpath(os.path.join(path, gitdir))
+            marker = os.sep + os.path.join(".git", "worktrees") + os.sep
+            return gitdir.split(marker)[0] if marker in gitdir else path
+        path = os.path.dirname(path)
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def project_of(cwd):
+    """Return a stable (key, display name, directory) for a working directory."""
+    root = repo_root(cwd)
+    key = root or cwd or "unknown"
+    name = os.path.basename(key.rstrip(os.sep)) or key
+    return key, name, root or cwd
+
+
+def compact_path(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path and path.startswith(home + os.sep) else path
+
+
+def print_spend_table(label, rows):
+    print(f"  {label:<24} {'Input':>10} {'Write':>10} {'Cached':>10} "
+          f"{'Output':>10} {'Total':>10}")
+    print(f"  {'─'*24} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+    for name, row in rows:
+        print(f"  {name[:24]:<24} {format_cost(row['input_cost']):>10} "
+              f"{format_cost(row['cache_write_cost']):>10} "
+              f"{format_cost(row['cache_read_cost']):>10} "
+              f"{format_cost(row['output_cost']):>10} {format_cost(row_cost(row)):>10}")
+    print()
+
+
+def print_token_table(label, rows):
+    print(f"  {label:<24} {'Input':>10} {'Write':>10} {'Cached':>10} "
+          f"{'Output':>10} {'Total':>10}")
+    print(f"  {'─'*24} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10}")
+    for name, row in rows:
+        print(f"  {name[:24]:<24} {format_tokens(row['input_tokens']):>10} "
+              f"{format_tokens(row['cache_write_tokens']):>10} "
+              f"{format_tokens(row['cache_read_tokens']):>10} "
+              f"{format_tokens(row['output_tokens']):>10} {format_tokens(row_tokens(row)):>10}")
+    print()
+
 # ─────────────────────── Main ───────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Audit Claude Code session logs for cold cache rebuilds."
     )
-    parser.add_argument("--days", type=int, default=7,
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument("--start", type=str,
+                        help="Window start: lookback (30m, 18h, 7d, 2w) or ISO date/datetime")
+    window.add_argument("--days", type=int,
                         help="Analyze last N days (default: 7)")
-    parser.add_argument("--since", type=str,
-                        help="Analyze since date (YYYY-MM-DD), overrides --days")
+    window.add_argument("--since", type=str,
+                        help="Analyze since date (YYYY-MM-DD); shorthand for --start")
+    window.add_argument("--since-reset", action="store_true",
+                        help="Analyze since the last weekly limit reset, inferred "
+                             "from the last weekly limit hit in the logs")
+    window.add_argument("--since-5h-reset", action="store_true",
+                        help="Analyze the current five-hour limit window, estimated "
+                             "from logged activity")
+    window.add_argument("--previous-reset", action="store_true",
+                        help="Analyze the weekly limit window before the current one")
+    window.add_argument("--previous-5h-reset", action="store_true",
+                        help="Analyze the last finished five-hour limit window, "
+                             "estimated from logged activity")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show every cold turn")
     parser.add_argument("--json", action="store_true",
@@ -444,17 +705,45 @@ def main():
     parser.add_argument("--infer-ttl", action="store_true",
                         help="Infer approximate cache TTL from intra-session "
                              "turn gaps (ignores --mode)")
+    parser.add_argument("--by-project", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Show per-repository spend and token breakdowns (default: on)")
+    parser.add_argument("--top-projects", type=int, default=15,
+                        help="Projects to list in the by-project breakdown (default: 15)")
     args = parser.parse_args()
 
-    if args.since:
-        since = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
-    else:
-        since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    now = datetime.now(timezone.utc)
+    start_arg = args.start or args.since or f"{args.days if args.days is not None else 7}d"
+    try:
+        since = parse_start(start_arg, now)
+    except ValueError:
+        parser.error(f"could not parse start {start_arg!r}; expected a lookback like "
+                     "30m, 18h, 7d, 2w or an ISO date/datetime")
+    if since >= now:
+        parser.error(f"start {since:%Y-%m-%d %H:%M} must be before now (UTC)")
 
     files = find_session_files()
     if not files:
         print("No session files found.", file=sys.stderr)
         sys.exit(1)
+
+    reset_window = None
+    until = now
+    five_hour = args.since_5h_reset or args.previous_5h_reset
+    try:
+        if args.since_reset:
+            since, reset_window = weekly_reset_start(find_limit_resets(files), now)
+        elif args.previous_reset:
+            since, until, reset_window = previous_weekly_window(find_limit_resets(files), now)
+        elif five_hour:
+            # Load everything from the window ending at the last logged reset;
+            # the windows are estimated from those turns below.
+            resets = find_limit_resets(files)
+            anchor = resets.get("five_hour")
+            since = (anchor - FIVE_HOURS if anchor
+                     else datetime.min.replace(tzinfo=timezone.utc))
+    except ValueError as e:
+        parser.error(str(e))
 
     # ── Collect all turns ──
     all_turns = []
@@ -463,6 +752,26 @@ def main():
             all_turns.append(turn)
 
     all_turns.sort(key=lambda t: t["timestamp"])
+
+    if five_hour:
+        # Limit rejections are logged as <synthetic> turns; they aren't activity.
+        activity = [t["timestamp"] for t in all_turns if t["model"] != "<synthetic>"]
+        try:
+            if args.since_5h_reset:
+                since, reset_window = five_hour_reset_start(resets, activity, now)
+            else:
+                since, until, reset_window = previous_five_hour_window(resets, activity, now)
+        except ValueError as e:
+            parser.error(str(e))
+    all_turns = [t for t in all_turns if since <= t["timestamp"] < until]
+
+    if reset_window is not None and not args.json:
+        if "ended_at" in reset_window:
+            print(f"  Inferred previous window: {since.isoformat()} -> "
+                  f"{until.isoformat()} (inferred from local logs)")
+        else:
+            print(f"  Inferred window start: {since.isoformat()}")
+            print(f"  Next reset: {reset_window['resets_at']} (inferred from local logs)")
 
     if not all_turns:
         print(f"No turns found since {since.strftime('%Y-%m-%d')}.", file=sys.stderr)
@@ -489,6 +798,12 @@ def main():
         "input_cost": 0.0, "cache_write_cost": 0.0,
         "cache_read_cost": 0.0, "output_cost": 0.0,
     })
+
+    model_breakdown = defaultdict(spend_row)
+    project_breakdown = defaultdict(
+        lambda: spend_row(name=None, path=None, sessions=set(),
+                          cold_count=0, cold_tokens=0, wasted=0.0,
+                          models=defaultdict(spend_row)))
 
     by_model = defaultdict(lambda: {"cold_count": 0, "warm_count": 0,
                                      "wasted": 0.0, "cold_tokens": 0})
@@ -520,10 +835,16 @@ def main():
         total_output_tokens += turn["output_tokens"]
         total_actual += costs["actual_cost"]
 
-        in_cost = turn["input_tokens"] * cost_per_token(tier, "input")
-        cw_cost = turn["cache_creation"] * cost_per_token(tier, "cache_write")
-        cr_cost = turn["cache_read"] * cost_per_token(tier, "cache_read")
-        out_cost = turn["output_tokens"] * cost_per_token(tier, "output")
+        in_cost = turn["input_tokens"] * cost_per_token(turn, "input")
+        cw_cost = costs["cache_write_cost"]
+        cr_cost = costs["cache_read_cost"]
+        out_cost = turn["output_tokens"] * cost_per_token(turn, "output")
+        turn_costs = {
+            "input_cost": in_cost,
+            "cache_write_cost": cw_cost,
+            "cache_read_cost": cr_cost,
+            "output_cost": out_cost,
+        }
 
         tb = tier_breakdown[tier]
         tb["input_tokens"] += turn["input_tokens"]
@@ -534,6 +855,17 @@ def main():
         tb["cache_write_cost"] += cw_cost
         tb["cache_read_cost"] += cr_cost
         tb["output_cost"] += out_cost
+
+        model_row = model_breakdown[turn["model"]]
+        add_turn(model_row, turn, turn_costs)
+
+        project_key, project_name, project_path = project_of(turn["cwd"])
+        project_row = project_breakdown[project_key]
+        project_row["name"] = project_name
+        project_row["path"] = project_path
+        project_row["sessions"].add(sid)
+        add_turn(project_row, turn, turn_costs)
+        add_turn(project_row["models"][turn["model"]], turn, turn_costs)
 
         # Per-day spend by category (every turn, not just cold ones).
         day = turn["timestamp"].strftime("%Y-%m-%d")
@@ -563,6 +895,10 @@ def main():
             by_day[day]["cold_count"] += 1
             by_day[day]["wasted"] += costs["wasted"]
             by_day[day]["cold_tokens"] += turn["cache_creation"]
+
+            project_row["cold_count"] += 1
+            project_row["cold_tokens"] += turn["cache_creation"]
+            project_row["wasted"] += costs["wasted"]
         else:
             warm_turns.append(turn)
 
@@ -591,7 +927,7 @@ def main():
         output = {
             "period": {
                 "since": since.isoformat(),
-                "until": datetime.now(timezone.utc).isoformat(),
+                "until": until.isoformat(),
             },
             "mode": args.mode,
             "summary": {
@@ -648,6 +984,14 @@ def main():
                     }
                     for tier, tb in tier_breakdown.items()
                 },
+                "by_exact_model": {
+                    model: {
+                        **row,
+                        "total_tokens": row_tokens(row),
+                        "total_cost": round(row_cost(row), 4),
+                    }
+                    for model, row in model_breakdown.items()
+                },
             },
             "by_model": {k: {**v, "wasted": round(v["wasted"], 4),
                              "wasted_share": share(v["wasted"])}
@@ -668,6 +1012,24 @@ def main():
                 }
                 for k, v in sorted(by_day_spend.items())
             },
+            "by_project": {
+                key: {
+                    **{k: v for k, v in row.items()
+                       if k not in ("sessions", "models")},
+                    "sessions": len(row["sessions"]),
+                    "total_tokens": row_tokens(row),
+                    "total_cost": round(row_cost(row), 4),
+                    "models": {
+                        model: {
+                            **model_row,
+                            "total_tokens": row_tokens(model_row),
+                            "total_cost": round(row_cost(model_row), 4),
+                        }
+                        for model, model_row in row["models"].items()
+                    },
+                }
+                for key, row in project_breakdown.items()
+            },
             "worst_sessions": sorted(
                 [{"session": k, **v, "wasted": round(v["wasted"], 4),
                   "wasted_share": share(v["wasted"])}
@@ -675,6 +1037,8 @@ def main():
                 key=lambda x: x["wasted"], reverse=True
             )[:10],
         }
+        if reset_window is not None:
+            output["period"]["reset_window"] = reset_window
         if args.verbose:
             output["cold_turns"] = [
                 {
@@ -699,7 +1063,7 @@ def main():
     print()
     print("=" * 65)
     print(f"  CACHE MONEY AUDIT  [{args.mode} mode]")
-    print(f"  {since.strftime('%Y-%m-%d')} → {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+    print(f"  {since.strftime('%Y-%m-%d')} → {until.strftime('%Y-%m-%d')}")
     print("=" * 65)
     print()
 
@@ -799,21 +1163,74 @@ def main():
                   f"mid-session cold rebuilds <<<")
         print()
 
-    # By model
-    if by_model:
+    # By exact model, across all turns.
+    if model_breakdown:
         print("─" * 65)
-        print("  BY MODEL (cold turns)")
+        print("  BY MODEL")
         print("─" * 65)
         print()
-        print(f"  {'Model':<10} {'Cold turns':>12} {'Cold tokens':>14} {waste_col:>12}")
-        print(f"  {'─'*10} {'─'*12} {'─'*14} {'─'*12}")
-        for tier in ["fable", "opus", "sonnet", "haiku"]:
-            if tier in by_model:
-                m = by_model[tier]
-                print(f"  {tier:<10} {m['cold_count']:>12,} "
-                      f"{format_tokens(m['cold_tokens']):>14} "
-                      f"{format_spend(m['wasted'], grand_total_cost, args.mode):>12}")
+        print(f"  {'Model':<24} {'Calls':>8} {'Input':>10} {'Output':>9} "
+              f"{'Hit':>8} {'Write':>9} {'Cost':>10}")
+        print(f"  {'─'*24} {'─'*8} {'─'*10} {'─'*9} {'─'*8} {'─'*9} {'─'*10}")
+        ranked_models = sorted(model_breakdown.items(), key=lambda item: -row_cost(item[1]))
+        for model, row in ranked_models:
+            prompt = (row["input_tokens"] + row["cache_write_tokens"]
+                      + row["cache_read_tokens"])
+            cache_total = row["cache_write_tokens"] + row["cache_read_tokens"]
+            hit = row["cache_read_tokens"] / cache_total if cache_total else 0
+            print(f"  {model[:24]:<24} {row['calls']:>8,} {format_tokens(prompt):>10} "
+                  f"{format_tokens(row['output_tokens']):>9} {format_pct(hit):>8} "
+                  f"{format_tokens(row['cache_write_tokens']):>9} "
+                  f"{format_cost(row_cost(row)):>10}")
         print()
+
+        print("  Spend by token type:")
+        print_spend_table("Model", ranked_models)
+        print("  Tokens by token type:")
+        print_token_table("Model", ranked_models)
+
+    # By repository / working directory, with nested exact-model rows.
+    if args.by_project and project_breakdown:
+        print("─" * 65)
+        print("  BY PROJECT")
+        print("─" * 65)
+        print()
+        ranked_projects = sorted(project_breakdown.items(),
+                                 key=lambda item: -row_cost(item[1]))
+        shown = ranked_projects[:args.top_projects]
+        print(f"  {'Project':<24} {'Sess':>5} {'Calls':>8} {'Tokens':>10} "
+              f"{'Hit':>8} {'Write':>9} {'Cost':>10}")
+        print(f"  {'─'*24} {'─'*5} {'─'*8} {'─'*10} {'─'*8} {'─'*9} {'─'*10}")
+        for _, row in shown:
+            cache_total = row["cache_write_tokens"] + row["cache_read_tokens"]
+            hit = row["cache_read_tokens"] / cache_total if cache_total else 0
+            print(f"  {row['name'][:24]:<24} {len(row['sessions']):>5,} "
+                  f"{row['calls']:>8,} {format_tokens(row_tokens(row)):>10} "
+                  f"{format_pct(hit):>8} {format_tokens(row['cache_write_tokens']):>9} "
+                  f"{format_cost(row_cost(row)):>10}")
+        if len(ranked_projects) > len(shown):
+            print(f"  … {len(ranked_projects) - len(shown):,} more")
+        print()
+
+        print("  Directories:")
+        for _, row in shown:
+            if row["path"]:
+                print(f"    {row['name'][:22]:<22} {compact_path(row['path'])}")
+        print()
+
+        spend_rows = []
+        token_rows = []
+        for _, row in shown:
+            spend_rows.append((row["name"], row))
+            token_rows.append((row["name"], row))
+            nested = sorted(row["models"].items(), key=lambda item: -row_cost(item[1]))
+            spend_rows.extend(("  " + model, model_row) for model, model_row in nested)
+            token_rows.extend(("  " + model, model_row) for model, model_row in nested)
+
+        print("  Spend by model:")
+        print_spend_table("Project / model", spend_rows)
+        print("  Tokens by model:")
+        print_token_table("Project / model", token_rows)
 
     # By day
     if by_day:

@@ -63,18 +63,68 @@ cold cache rebuilds — and how much was preventable.
 
 ```bash
 python3 cache-money-audit.py                       # last 7 days (subscription mode)
+python3 cache-money-audit.py --start 18h           # relative lookback
+python3 cache-money-audit.py --start 2026-09-01    # ISO date or datetime
+python3 cache-money-audit.py --since-reset         # since the last weekly limit reset
+python3 cache-money-audit.py --since-5h-reset      # current five-hour limit window
+python3 cache-money-audit.py --previous-reset      # the weekly window before that
+python3 cache-money-audit.py --previous-5h-reset   # the last finished five-hour window
 python3 cache-money-audit.py --days 30             # last 30 days
 python3 cache-money-audit.py --mode api            # frame waste as dollars
 python3 cache-money-audit.py --infer-ttl           # estimate cache TTL from logs
+python3 cache-money-audit.py --no-by-project       # hide repository breakdowns
 python3 cache-money-audit.py --verbose             # show every cold turn
 python3 cache-money-audit.py --json                # machine-readable
 ```
+
+`--start` accepts a lookback (`30m`, `18h`, `7d`, or `2w`) or an ISO date or
+datetime, interpreted as UTC when no offset is present. `--days N` and
+`--since DATE` remain available as shorthands.
+
+`--since-reset` runs the usual report from the last weekly limit reset.
+Claude Code only logs a reset time when a limit is hit, so it takes the most
+recent weekly limit hit in the logs and rolls that reset forward in whole
+weeks. It fails if the logs hold no weekly limit hit, and is wrong if your
+weekly reset time has moved since the last one.
+
+`--since-5h-reset` covers the current five-hour window. This is an estimate:
+starting from the last logged five-hour limit hit, it replays your activity,
+opening each window on the first turn after the previous one ends (floored to
+the hour). Usage outside Claude Code on this machine also opens windows and
+is not in the logs.
+
+`--previous-reset` reports the weekly window before the current one, e.g.
+last week's usage once a new week has started. It runs from one week before
+the inferred reset up to that reset, with the same caveats as `--since-reset`.
+
+`--previous-5h-reset` reports the last finished five-hour window: the one
+before the current window, or the most recent one if none is open. It uses
+the same replay as `--since-5h-reset`. If the next window's start (floored to
+the hour) falls before this one's reset, it ends where the next one begins,
+so no turn is counted in both. It fails if no earlier window is in the logs.
+
+None of these can be combined with each other or with `--start`, `--days`, or
+`--since`. In `--json` output, `period.reset_window` records the inferred
+window, including `ended_at` for the previous-window modes.
 
 Spend framing (two modes):
 - **`subscription`** (default) — cold-rebuild waste and per-session costs
   framed as percent of total token spend. For Pro/Max users, rate-limit
   headroom is the real constraint.
 - **`api`** — same spend breakdown up top, but waste shown in dollars.
+
+The report also breaks all usage down by exact model and project. Model tables
+show calls, input, output, cache hit rate, cache writes, and API-equivalent
+cost, followed by spend and token splits for uncached input, cache writes,
+cache reads, and output.
+
+Project grouping uses the working directory recorded in each Claude session
+event and walks up to the nearest Git repository. This keeps subdirectories
+and agent worktrees under their parent repository. Each project includes the
+same spend and token splits, with indented rows for the exact models used
+there. Use `--top-projects N` to change the number shown (default 15), or
+`--no-by-project` to omit this section. The same data is available under
+`spend_breakdown.by_exact_model` and `by_project` in `--json` output.
 
 TTL inference (`--infer-ttl`):
 Buckets intra-session turn pairs by the gap since the previous turn and
